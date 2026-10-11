@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
-#include <stdatomic.h>
 #include "z80.h"
 
 #define SCREEN_WIDTH 320
@@ -28,8 +27,6 @@ static uint8_t beeper_bit = 0;
 static uint8_t spec_border_color = 7;
 static FILE *active_tape_file = NULL;
 
-// Временная шкала CPU. cpu_tstates_total монотонен между сбросами;
-// current_frame_tstates используется только для локального времени кадра.
 #define CPU_CLOCK_HZ       3494400ULL  // 69888 T-state * 50 кадров/с (Spectrum 48K)
 #define AY_CLOCK_HZ        1773400ULL  // приблизительная частота AY на Spectrum 128K
 #define AUDIO_SAMPLE_RATE  44100ULL
@@ -82,6 +79,9 @@ struct AY_State {
     int32_t noise_counter;
     uint32_t noise_shift_reg;
     uint8_t noise_output;
+
+    // Кэшированные уровни громкости каналов (вычисляются в apply_due_audio_events)
+    int16_t chan_volume[3];
 } ay;
 
 struct AY_Envelope {
@@ -91,36 +91,32 @@ struct AY_Envelope {
     uint8_t holding;
 } ay_env;
 
-// Локальная копия регистров для пошагового наката внутри рендера
-static uint8_t local_ay_regs[16];
 static uint8_t local_ay_selected_reg = 0;
 static uint8_t local_beeper_bit = 0;
 
 #define AUDIO_RING_SIZE 16384
 static int16_t audio_ring_buffer[AUDIO_RING_SIZE];
-static atomic_uint_least32_t audio_ring_head = ATOMIC_VAR_INIT(0);
-static atomic_uint_least32_t audio_ring_tail = ATOMIC_VAR_INIT(0);
+static volatile uint32_t audio_ring_head = 0;
+static volatile uint32_t audio_ring_tail = 0;
 
-// Single-producer (поток эмуляции) / single-consumer (аудиоколбэк) ring buffer.
 void audio_ring_push(int16_t sample) {
-    uint32_t head = atomic_load_explicit(&audio_ring_head, memory_order_relaxed);
+    uint32_t head = audio_ring_head;
     uint32_t next_head = (head + 1u) % AUDIO_RING_SIZE;
-    uint32_t tail = atomic_load_explicit(&audio_ring_tail, memory_order_acquire);
+    uint32_t tail = audio_ring_tail;
     if (next_head != tail) {
         audio_ring_buffer[head] = sample;
-        atomic_store_explicit(&audio_ring_head, next_head, memory_order_release);
+        audio_ring_head = next_head;
     }
-    // При переполнении отбрасываем новый сэмпл; индексы остаются согласованными.
 }
 
 void zx48_get_audio_samples(int16_t *buffer, int sample_count) {
     if (!buffer || sample_count <= 0) return;
     for (int i = 0; i < sample_count; i++) {
-        uint32_t tail = atomic_load_explicit(&audio_ring_tail, memory_order_relaxed);
-        uint32_t head = atomic_load_explicit(&audio_ring_head, memory_order_acquire);
+        uint32_t tail = audio_ring_tail;
+        uint32_t head = audio_ring_head;
         if (tail != head) {
             buffer[i] = audio_ring_buffer[tail];
-            atomic_store_explicit(&audio_ring_tail, (tail + 1u) % AUDIO_RING_SIZE, memory_order_release);
+            audio_ring_tail = (tail + 1u) % AUDIO_RING_SIZE;
         } else {
             buffer[i] = 0;
         }
@@ -191,13 +187,11 @@ uint8_t InPort(uint16_t port) {
 }
 
 // ============================================================================
-//   ТОЧНЫЙ СИНХРОННЫЙ АУДИОДВИЖОК С АНАЛИЗОМ СОБЫТИЙ БУФЕРА
+//   ОПТИМИЗИРОВАННЫЙ СИНХРОННЫЙ АУДИОДВИЖОК
 // ============================================================================
 static void ay_clock_tick(void) {
-    // Tone generators: one counter step per AY clock / 8.
     for (int chan = 0; chan < 3; chan++) {
-        uint32_t period = ((uint32_t)(local_ay_regs[chan * 2 + 1] & 0x0F) << 8) |
-                          local_ay_regs[chan * 2];
+        uint32_t period = ((uint32_t)(ay.regs[chan * 2 + 1] & 0x0F) << 8) | ay.regs[chan * 2];
         if (period == 0) period = 1;
         if (++ay.tone_counters[chan] >= (int32_t)period) {
             ay.tone_counters[chan] -= (int32_t)period;
@@ -205,46 +199,55 @@ static void ay_clock_tick(void) {
         }
     }
 
-    // Noise advances at AY clock / 16, i.e. once per two tone ticks.
     if (++noise_prescaler >= 2) {
         noise_prescaler = 0;
-        uint32_t noise_period = local_ay_regs[6] & 0x1F;
+        uint32_t noise_period = ay.regs[6] & 0x1F;
         if (noise_period == 0) noise_period = 1;
         if (++ay.noise_counter >= (int32_t)noise_period) {
             ay.noise_counter = 0;
-            uint8_t feedback = (uint8_t)((ay.noise_shift_reg ^ (ay.noise_shift_reg >> 3)) & 1u);
-            ay.noise_shift_reg = (ay.noise_shift_reg >> 1) | ((uint32_t)feedback << 16);
-            ay.noise_shift_reg &= 0x1FFFFu;
+            // Пункт 3: Быстрая форма генератора шума
+            ay.noise_shift_reg = (ay.noise_shift_reg >> 1) | (((ay.noise_shift_reg ^ (ay.noise_shift_reg >> 3)) & 1) << 16);
             ay.noise_output = (uint8_t)(ay.noise_shift_reg & 1u);
         }
     }
 
-    // AY envelope clock is AY clock / 256: once per 32 tone ticks.
     if (++envelope_prescaler >= 32) {
         envelope_prescaler = 0;
-        uint32_t env_period = ((uint32_t)local_ay_regs[12] << 8) | local_ay_regs[11];
+        uint32_t env_period = ((uint32_t)ay.regs[12] << 8) | ay.regs[11];
         if (env_period == 0) env_period = 1;
         if (!ay_env.holding && ++ay_env.count >= env_period) {
             ay_env.count = 0;
             --ay_env.step;
             if (ay_env.step < 0) {
-                uint8_t shape = local_ay_regs[13] & 0x0F;
+                uint8_t shape = ay.regs[13] & 0x0F;
                 if ((shape & 0x08) == 0) {
-                    // Continue=0: finish at the level selected by Attack.
                     ay_env.step = 0;
                     ay_env.holding = 1;
                 } else if (shape & 0x01) {
-                    // Hold=1: optionally invert the final level, then stop.
                     if (shape & 0x02) ay_env.attack_mask ^= 0x0F;
                     ay_env.step = 0;
                     ay_env.holding = 1;
                 } else {
-                    // Continuous shape: restart; Alternate reverses direction.
                     if (shape & 0x02) ay_env.attack_mask ^= 0x0F;
                     ay_env.step = 15;
                 }
             }
         }
+    }
+}
+
+// Вспомогательная функция для обновления кэша громкости конкретного канала
+static void update_cached_volume(int chan) {
+    static const int16_t volume_table[16] = {
+        0, 200, 290, 420, 610, 880, 1270, 1840,
+        2660, 3850, 5570, 8060, 11660, 16860, 24400, 32767
+    };
+    uint8_t vol = ay.regs[8 + chan];
+    if (vol & 0x10) {
+        // Если используется огибающая, громкость динамическая (считается в микшере)
+        ay.chan_volume[chan] = -1;
+    } else {
+        ay.chan_volume[chan] = volume_table[vol & 0x0F] / 3;
     }
 }
 
@@ -256,8 +259,14 @@ static void apply_due_audio_events(void) {
         if (evt->type == EVENT_AY_REG_SELECT) {
             local_ay_selected_reg = evt->value & 0x0F;
         } else if (evt->type == EVENT_AY_REG_WRITE) {
-            local_ay_regs[local_ay_selected_reg] = evt->value;
-            if (local_ay_selected_reg == 13) {
+            ay.regs[local_ay_selected_reg] = evt->value;
+            
+            // Если обновились регистры громкости или микшера — инвалидируем/обновляем кэш
+            if (local_ay_selected_reg >= 8 && local_ay_selected_reg <= 10) {
+                update_cached_volume(local_ay_selected_reg - 8);
+            } else if (local_ay_selected_reg == 7) {
+                update_cached_volume(0); update_cached_volume(1); update_cached_volume(2);
+            } else if (local_ay_selected_reg == 13) {
                 uint8_t shape = evt->value & 0x0F;
                 ay_env.count = 0;
                 ay_env.step = 15;
@@ -271,30 +280,52 @@ static void apply_due_audio_events(void) {
     }
 }
 
+// Сверхбыстрый микшер без циклов и накладных расходов
 static int16_t mix_audio_sample(void) {
     static const int16_t volume_table[16] = {
         0, 200, 290, 420, 610, 880, 1270, 1840,
         2660, 3850, 5570, 8060, 11660, 16860, 24400, 32767
     };
-    uint8_t mixer = local_ay_regs[7];
+    uint8_t mixer = ay.regs[7];
     int32_t ay_mixed_out = 0;
 
-    for (int chan = 0; chan < 3; chan++) {
-        bool tone_disabled = (mixer & (1u << chan)) != 0;
-        bool noise_disabled = (mixer & (1u << (chan + 3))) != 0;
-        uint8_t chan_out = 1;
-        if (!tone_disabled) chan_out &= ay.tone_outputs[chan];
-        if (!noise_disabled) chan_out &= ay.noise_output;
-        if (chan_out) {
-            uint8_t vol = local_ay_regs[8 + chan];
-            uint8_t level = (vol & 0x10)
-                ? (uint8_t)((ay_env.step ^ ay_env.attack_mask) & 0x0F)
-                : (uint8_t)(vol & 0x0F);
-            ay_mixed_out += volume_table[level] / 3;
+    // Канал A
+    if (!((mixer & 1) && (mixer & 8))) { // Если тон или шум включены
+        if ((mixer & 1) || ay.tone_outputs[0]) {
+            if ((mixer & 8) || ay.noise_output) {
+                int16_t v = ay.chan_volume[0];
+                ay_mixed_out += (v >= 0) ? v : (volume_table[(ay_env.step ^ ay_env.attack_mask) & 0x0F] / 3);
+            }
+        }
+    }
+    // Канал B
+    if (!((mixer & 2) && (mixer & 16))) {
+        if ((mixer & 2) || ay.tone_outputs[1]) {
+            if ((mixer & 16) || ay.noise_output) {
+                int16_t v = ay.chan_volume[1];
+                ay_mixed_out += (v >= 0) ? v : (volume_table[(ay_env.step ^ ay_env.attack_mask) & 0x0F] / 3);
+            }
+        }
+    }
+    // Канал B
+    if (!((mixer & 2) && (mixer & 16))) {
+        if ((mixer & 2) || ay.tone_outputs[1]) {
+            if ((mixer & 16) || ay.noise_output) {
+                int16_t v = ay.chan_volume[1];
+                ay_mixed_out += (v >= 0) ? v : (volume_table[(ay_env.step ^ ay_env.attack_mask) & 0x0F] / 3);
+            }
+        }
+    }
+    // Канал C
+    if (!((mixer & 4) && (mixer & 32))) {
+        if ((mixer & 4) || ay.tone_outputs[2]) {
+            if ((mixer & 32) || ay.noise_output) {
+                int16_t v = ay.chan_volume[2];
+                ay_mixed_out += (v >= 0) ? v : (volume_table[(ay_env.step ^ ay_env.attack_mask) & 0x0F] / 3);
+            }
         }
     }
 
-    // Сохраняем прежний уровень бипера; полноценный DC-фильтр здесь не меняем.
     int32_t sample = ay_mixed_out + (local_beeper_bit ? 4000 : 0);
     if (sample > 32767) sample = 32767;
     if (sample < -32768) sample = -32768;
@@ -304,7 +335,7 @@ static int16_t mix_audio_sample(void) {
 void zx48_tick_audio(uint32_t cycles) {
     if (ay.noise_shift_reg == 0) ay.noise_shift_reg = 1;
     uint64_t target_tstates = cpu_tstates_total;
-    (void)cycles; // Интервал берётся из монотонной временной шкалы CPU.
+    (void)cycles;
 
     // Обрабатываем временную шкалу по T-state. Это сохраняет порядок событий AY,
     // фазу генераторов и частоту сэмплирования независимо от границ кадров/инструкций.
@@ -362,7 +393,6 @@ void zx48_reset(void) {
     
     // 4. Сбрасываем звуковой сопроцессор AY-3-8912 и огибающую
     memset(ay.regs, 0, sizeof(ay.regs));
-    memset(local_ay_regs, 0, sizeof(local_ay_regs));
     ay.selected_reg = 0;
     local_ay_selected_reg = 0;
     
@@ -371,6 +401,8 @@ void zx48_reset(void) {
     ay.noise_counter = 0;
     ay.noise_shift_reg = 1;
     ay.noise_output = 1;
+    
+    ay.chan_volume[0] = 0; ay.chan_volume[1] = 0; ay.chan_volume[2] = 0;
     
     ay_env.count = 0;
     ay_env.step = 0;
@@ -391,8 +423,6 @@ void zx48_reset(void) {
 
     audio_event_head = 0;
     audio_event_tail = 0;
-    // Не сбрасываем индексы SPSC-буфера из потока эмуляции: tail принадлежит
-    // аудиопотребителю. Уже поставленные сэмплы будут дочитаны аудиоколбэком.
     
     // 6. Если была вставлена лента, закрываем её
     if (active_tape_file) {
@@ -402,7 +432,6 @@ void zx48_reset(void) {
     
     // 7. Вызываем аппаратный сброс процессора Z80 (PC = 0x0000, сброс флагов и прерываний)
     init();
-
     printf("Эмулятор успешно перезапущен (Hard Reset).\n");
 }
 
