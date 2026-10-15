@@ -167,7 +167,10 @@ static void AudioQueueCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueB
     
     // Обновляем содержимое слоя в основном потоке с правильным ARC-модификатором
     if (imageRef) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
         self.emulationLayer.contents = (__bridge id _Nullable)(imageRef);
+        [CATransaction commit];
         CGImageRelease(imageRef);
     }
     
@@ -245,7 +248,13 @@ static void AudioQueueCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueB
         case kVK_ANSI_M:      zx48_press_key(7, 2, isPressed); break;
         case kVK_ANSI_N:      zx48_press_key(7, 3, isPressed); break;
         case kVK_ANSI_B:      zx48_press_key(7, 4, isPressed); break;
-            
+
+        // стрелки
+        case kVK_LeftArrow:  zx48_press_key(0, 0, isPressed); zx48_press_key(3, 4, isPressed); break; // CS+5
+        case kVK_DownArrow:  zx48_press_key(0, 0, isPressed); zx48_press_key(4, 4, isPressed); break; // CS+6
+        case kVK_UpArrow:    zx48_press_key(0, 0, isPressed); zx48_press_key(4, 3, isPressed); break; // CS+7
+        case kVK_RightArrow: zx48_press_key(0, 0, isPressed); zx48_press_key(4, 2, isPressed); break; // CS+8            
+
         default: break;
     }
 }
@@ -318,8 +327,7 @@ static void AudioQueueCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueB
     panel.canChooseDirectories = NO;
     panel.allowsMultipleSelection = NO;
     panel.allowedContentTypes = @[
-        [UTType typeWithFilenameExtension:@"tap"],
-        [UTType typeWithFilenameExtension:@"tzx"]
+        [UTType typeWithFilenameExtension:@"tap"]
     ];
     
     [panel beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse returnCode) {

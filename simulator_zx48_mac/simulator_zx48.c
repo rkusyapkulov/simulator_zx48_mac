@@ -23,6 +23,9 @@ static uint8_t zx48_rom[16384];
 static uint8_t zx48_ram[49152];
 static uint32_t pixel_buffer[SCREEN_WIDTH * SCREEN_HEIGHT];
 
+static uint8_t flash_frame = 0;
+static bool    flash_phase = false;
+
 static uint8_t beeper_bit = 0;
 static uint8_t spec_border_color = 7;
 static FILE *active_tape_file = NULL;
@@ -170,17 +173,10 @@ uint8_t InPort(uint16_t port) {
         return result | 0xE0;
     }
 
-    // 2. Чтение текущего состояния выбранного регистра AY
-    if (port == 0xBFFD) {
-        // Защита I/O портов: возвращаем 0xFF (Kempston Joystick опрашивается по 0x1F, а не через AY)
-        if (ay.selected_reg == 14 || ay.selected_reg == 15) {
-            return 0xFF;
-        }
-        return ay.regs[ay.selected_reg];
-    }
-    
+    // 2. Чтение выбранного регистра AY - только через порт 0xFFFD (0xBFFD только для записи)
     if (port == 0xFFFD) {
-        return ay.selected_reg;
+        if (ay.selected_reg == 14 || ay.selected_reg == 15) return 0xFF;
+        return ay.regs[ay.selected_reg & 0x0F];
     }
     
     return 0xFF; // Floating bus по умолчанию
@@ -211,7 +207,7 @@ static void ay_clock_tick(void) {
         }
     }
 
-    if (++envelope_prescaler >= 32) {
+    if (++envelope_prescaler >= 2) {
         envelope_prescaler = 0;
         uint32_t env_period = ((uint32_t)ay.regs[12] << 8) | ay.regs[11];
         if (env_period == 0) env_period = 1;
@@ -221,6 +217,7 @@ static void ay_clock_tick(void) {
             if (ay_env.step < 0) {
                 uint8_t shape = ay.regs[13] & 0x0F;
                 if ((shape & 0x08) == 0) {
+                    ay_env.attack_mask = 0;
                     ay_env.step = 0;
                     ay_env.holding = 1;
                 } else if (shape & 0x01) {
@@ -289,40 +286,13 @@ static int16_t mix_audio_sample(void) {
     uint8_t mixer = ay.regs[7];
     int32_t ay_mixed_out = 0;
 
-    // Канал A
-    if (!((mixer & 1) && (mixer & 8))) { // Если тон или шум включены
-        if ((mixer & 1) || ay.tone_outputs[0]) {
-            if ((mixer & 8) || ay.noise_output) {
-                int16_t v = ay.chan_volume[0];
-                ay_mixed_out += (v >= 0) ? v : (volume_table[(ay_env.step ^ ay_env.attack_mask) & 0x0F] / 3);
-            }
-        }
-    }
-    // Канал B
-    if (!((mixer & 2) && (mixer & 16))) {
-        if ((mixer & 2) || ay.tone_outputs[1]) {
-            if ((mixer & 16) || ay.noise_output) {
-                int16_t v = ay.chan_volume[1];
-                ay_mixed_out += (v >= 0) ? v : (volume_table[(ay_env.step ^ ay_env.attack_mask) & 0x0F] / 3);
-            }
-        }
-    }
-    // Канал B
-    if (!((mixer & 2) && (mixer & 16))) {
-        if ((mixer & 2) || ay.tone_outputs[1]) {
-            if ((mixer & 16) || ay.noise_output) {
-                int16_t v = ay.chan_volume[1];
-                ay_mixed_out += (v >= 0) ? v : (volume_table[(ay_env.step ^ ay_env.attack_mask) & 0x0F] / 3);
-            }
-        }
-    }
-    // Канал C
-    if (!((mixer & 4) && (mixer & 32))) {
-        if ((mixer & 4) || ay.tone_outputs[2]) {
-            if ((mixer & 32) || ay.noise_output) {
-                int16_t v = ay.chan_volume[2];
-                ay_mixed_out += (v >= 0) ? v : (volume_table[(ay_env.step ^ ay_env.attack_mask) & 0x0F] / 3);
-            }
+    // Канал звучит, если "тон выключен или тон=1" И "шум выключен или шум=1".
+    // Если выключены оба источника, на выходе постоянная 1 (громкость меняется записью в регистр).
+    for (int ch = 0; ch < 3; ch++) {
+        if (((mixer & (1 << ch)) || ay.tone_outputs[ch]) &&
+            ((mixer & (8 << ch)) || ay.noise_output)) {
+            int16_t v = ay.chan_volume[ch];
+            ay_mixed_out += (v >= 0) ? v : (volume_table[(ay_env.step ^ ay_env.attack_mask) & 0x0F] / 3);
         }
     }
 
@@ -474,6 +444,10 @@ void RenderSpectrumScreenToBuffer(void) {
             
             uint32_t ink_rgba   = palette[ink + bright];
             uint32_t paper_rgba = palette[paper + bright];
+
+            if ((attr & 0x80) && flash_phase) {
+                uint32_t tmp = ink_rgba; ink_rgba = paper_rgba; paper_rgba = tmp;
+            }
             
             int dest_pixel_idx = line_start_idx + BORDER_X + (x_byte * 8);
 
@@ -506,52 +480,48 @@ void RenderSpectrumScreenToBuffer(void) {
 static void HandleRomTapeHook(void) {
     if (!active_tape_file) return;
 
-    // Считываем точные параметры запроса из регистровой структуры Z80 ядра
-    // IX = адрес назначения, DE = длина запрашиваемого блока, A = ожидаемый флаг типа
     uint16_t dest_address = cpu.IX;
     uint16_t expected_len = ((uint16_t)cpu.D << 8) | cpu.E;
-    uint8_t expected_flag = cpu.A;
-    uint16_t block_len = 0;
-    
-    // Считываем заголовок очередного блока из TAP-файла
-    if (fread(&block_len, 2, 1, active_tape_file) == 1) {
-        uint8_t *buffer = malloc(block_len);
-        if (fread(buffer, 1, block_len, active_tape_file) == block_len) {
-            uint8_t current_flag = buffer[0];
+    uint8_t  expected_flag = cpu.A;
+    int      is_load = (cpu.F & 0x01) != 0;   // CF=1 - LOAD, CF=0 - VERIFY
 
-            // Загрузка срабатывает только если флаг совпадает с ожидаемым системным (0x00 или 0xFF)
-            if (current_flag == expected_flag) {
-                uint16_t actual_data_len = block_len - 2; // Минус байт флага и байт контрольной суммы
-                if (actual_data_len > expected_len) actual_data_len = expected_len;
-
-                // Побайтово инжектируем блок данных прямо в ОЗУ эмулятора
-                if (dest_address >= 0x4000) {
-                    for (uint16_t i = 0; i < actual_data_len; i++) {
-                        WriteByte(dest_address + i, buffer[1 + i]);
-                    }
-                    // Обновляем регистры HL в соответствии со стандартами выхода из подпрограммы ПЗУ
-                    uint16_t target = dest_address + actual_data_len;
-                    cpu.H = target >> 8;
-                    cpu.L = target & 0xFF;
-                }
-
-                // Корректное перестроение флагов Z80 ядра для выхода из процедуры загрузки ПЗУ
-                cpu.F = 0x01;    // Сигнал для ОС: Блок прочитан успешно (Carry Flag = 1)
-                cpu.A = current_flag;
-                cpu.D = 0;
-                cpu.E = 0;
-                cpu.PC = 0x056B; // Принудительный скачок на адрес успешного завершения LOAD в Spectrum ROM
-            } else {
-                // Если блок в TAP-файле не совпал с ожидаемым (например, пропустили заголовок),
-                // возвращаем указатель файла назад, чтобы не пропустить нужные данные
-                fseek(active_tape_file, -(block_len + 2), SEEK_CUR);
+    for (;;) {
+        uint8_t hdr[2];
+        if (fread(hdr, 1, 2, active_tape_file) != 2) {   // лента закончилась
+            fclose(active_tape_file);
+            active_tape_file = NULL;
+            return;
+        }
+        uint16_t block_len = (uint16_t)(hdr[0] | (hdr[1] << 8));
+        uint8_t* buffer = (uint8_t*)malloc(block_len ? block_len : 1);
+        if (!buffer) return;
+        if (fread(buffer, 1, block_len, active_tape_file) != block_len) {
+            free(buffer);
+            fclose(active_tape_file);
+            active_tape_file = NULL;
+            return;
+        }
+        if (block_len < 2 || buffer[0] != expected_flag) {   // чужой блок: пропускаем
+            free(buffer);
+            continue;
+        }
+        uint16_t data_len = (uint16_t)(block_len - 2);
+        if (data_len == expected_len) {
+            if (is_load) {
+                for (uint16_t i = 0; i < data_len; i++)
+                    WriteByte((uint16_t)(dest_address + i), buffer[1 + i]);
             }
+            cpu.IX = (uint16_t)(dest_address + data_len);
+            cpu.D = 0;
+            cpu.E = 0;
+            cpu.F = 0x01;    // успех: CF=1
+        }
+        else {
+            cpu.F = 0x00;    // "R Tape loading error": CF=0
         }
         free(buffer);
-    } else {
-        // Если лента докрутилась до конца, закрываем файл магнитофона
-        fclose(active_tape_file);
-        active_tape_file = NULL;
+        cpu.PC = 0x056B;     // это RET NZ: при Z=0 возврат к вызывающему коду
+        return;
     }
 }
 
@@ -575,6 +545,7 @@ void zx48_run_frame(void) {
         }
     }
     z80_interrupt_now(0xFF);
+    if (++flash_frame >= 16) { flash_frame = 0; flash_phase = !flash_phase; }
     RenderSpectrumScreenToBuffer();
 }
 
@@ -616,10 +587,11 @@ bool zx48_load_z80(const char *filepath) {
     uint16_t pc = header[6] | (header[7] << 8);
     cpu.SP = header[8] | (header[9] << 8);
     cpu.I = header[10];
-    cpu.RR = header[11];
 
     uint8_t indicator = header[12];
     if (indicator == 255) indicator = 1; // Корректировка флага сжатия данных v1
+    cpu.RR = (header[11] & 0x7F) | ((indicator & 1) << 7);   // бит 7 R лежит в байте 12
+    bool v1_compressed = (indicator & 0x20) != 0;
     spec_border_color = (indicator >> 1) & 0x07;
 
     cpu.E = header[13]; cpu.D = header[14];
@@ -639,9 +611,18 @@ bool zx48_load_z80(const char *filepath) {
 
     if (!version_1) {
         // Снапшот v2 или v3
-        uint16_t ext_header_len = fgetc(f) | (fgetc(f) << 8);
-        uint8_t *ext_header = malloc(ext_header_len);
-        fread(ext_header, 1, ext_header_len, f);
+        int lo = fgetc(f);
+        int hi = fgetc(f);
+        if (lo == EOF || hi == EOF) { fclose(f); return false; }
+        uint16_t ext_header_len = (uint16_t)(lo | (hi << 8));
+        if (ext_header_len < 23) { fclose(f); return false; }
+        uint8_t* ext_header = malloc(ext_header_len);
+        if (!ext_header || fread(ext_header, 1, ext_header_len, f) != ext_header_len) {
+            free(ext_header); fclose(f); return false;
+        }
+        uint8_t hw_mode = ext_header[2];
+        bool is_v3 = (ext_header_len != 23);
+        if (!(hw_mode <= 1 || (is_v3 && hw_mode == 3))) { free(ext_header); fclose(f); return false; }
 
         pc = ext_header[0] | (ext_header[1] << 8);
         compressed_data_start = 32 + ext_header_len;
@@ -657,7 +638,7 @@ bool zx48_load_z80(const char *filepath) {
         size_t ram_ptr = 0;
         int c1, c2;
 
-        while ((c1 = fgetc(f)) != EOF && ram_ptr < 49152) {
+        while (v1_compressed && (c1 = fgetc(f)) != EOF && ram_ptr < 49152) {
             if (c1 == 0xED) {
                 c2 = fgetc(f);
                 if (c2 == 0xED) {
@@ -674,7 +655,8 @@ bool zx48_load_z80(const char *filepath) {
                 ram_buffer[ram_ptr++] = c1;
             }
         }
-        memcpy(zx48_ram, ram_buffer, 49152);
+        if (!v1_compressed) ram_ptr = fread(ram_buffer, 1, 49152, f);
+        memcpy(zx48_ram, ram_buffer, ram_ptr);
     } else {
         // Декомпрессия постраничных блоков памяти v2/v3 (для 48K Spectrum)
         uint16_t block_size;
@@ -683,24 +665,24 @@ bool zx48_load_z80(const char *filepath) {
             uint8_t *target_ram_bank = NULL;
 
             // Маппинг страниц памяти формата .z80 v2 на линейную RAM 48K эмулятора
-            if (page_num == 4)      target_ram_bank = &zx48_ram[0x4000 - 0x4000];
-            else if (page_num == 5) target_ram_bank = &zx48_ram[0x8000 - 0x4000];
-            else if (page_num == 8) target_ram_bank = &zx48_ram[0xC000 - 0x4000];
+            if (page_num == 8)      target_ram_bank = &zx48_ram[0x4000 - 0x4000];
+            else if (page_num == 4) target_ram_bank = &zx48_ram[0x8000 - 0x4000];
+            else if (page_num == 5) target_ram_bank = &zx48_ram[0xC000 - 0x4000];
 
             if (block_size == 0xFFFF) {
                 if (target_ram_bank) fread(target_ram_bank, 1, 16384, f);
                 else fseek(f, 16384, SEEK_CUR);
             } else {
-                uint8_t *comp_buf = malloc(block_size);
-                fread(comp_buf, 1, block_size, f);
-                
+                uint8_t* comp_buf = malloc(block_size ? block_size : 1);
+                if (!comp_buf || fread(comp_buf, 1, block_size, f) != block_size) { free(comp_buf); break; }
+
                 if (target_ram_bank) {
                     size_t out_idx = 0;
                     for (size_t in_idx = 0; in_idx < block_size; ) {
-                        if (in_idx <= block_size - 4 && comp_buf[in_idx] == 0x00 && comp_buf[in_idx+1] == 0xED && comp_buf[in_idx+2] == 0xED && comp_buf[in_idx+3] == 0x00) {
+                        if (in_idx + 4 <= block_size && comp_buf[in_idx] == 0x00 && comp_buf[in_idx+1] == 0xED && comp_buf[in_idx+2] == 0xED && comp_buf[in_idx+3] == 0x00) {
                             break;
                         }
-                        if (in_idx <= block_size - 4 && comp_buf[in_idx] == 0xED && comp_buf[in_idx+1] == 0xED) {
+                        if (in_idx + 4 <= block_size && comp_buf[in_idx] == 0xED && comp_buf[in_idx+1] == 0xED) {
                             int count = comp_buf[in_idx+2];
                             uint8_t value = comp_buf[in_idx+3];
                             for (int k = 0; k < count && out_idx < 16384; k++) target_ram_bank[out_idx++] = value;
